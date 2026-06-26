@@ -8,6 +8,7 @@ import type { ResourceDiagnostic } from "./diagnostics.ts";
 export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.ts";
 
 import { canonicalizePath, isLocalPath, resolvePath } from "../utils/paths.ts";
+import { getBuiltinPromptTemplates } from "./builtin-extensions/index.ts";
 import { createEventBus, type EventBus } from "./event-bus.ts";
 import {
 	clearExtensionCache,
@@ -29,6 +30,11 @@ export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
 	promptPaths?: Array<{ path: string; metadata: PathMetadata }>;
 	themePaths?: Array<{ path: string; metadata: PathMetadata }>;
+}
+
+export interface NamedExtensionFactory {
+	name: string;
+	factory: ExtensionFactory;
 }
 
 export interface ResourceLoaderReloadOptions {
@@ -131,6 +137,7 @@ export interface DefaultResourceLoaderOptions {
 	additionalSkillPaths?: string[];
 	additionalPromptTemplatePaths?: string[];
 	additionalThemePaths?: string[];
+	builtinExtensionFactories?: NamedExtensionFactory[];
 	extensionFactories?: ExtensionFactory[];
 	noExtensions?: boolean;
 	noSkills?: boolean;
@@ -169,6 +176,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private additionalSkillPaths: string[];
 	private additionalPromptTemplatePaths: string[];
 	private additionalThemePaths: string[];
+	private builtinExtensionFactories: NamedExtensionFactory[];
 	private extensionFactories: ExtensionFactory[];
 	private noExtensions: boolean;
 	private noSkills: boolean;
@@ -228,6 +236,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		this.additionalSkillPaths = options.additionalSkillPaths ?? [];
 		this.additionalPromptTemplatePaths = options.additionalPromptTemplatePaths ?? [];
 		this.additionalThemePaths = options.additionalThemePaths ?? [];
+		this.builtinExtensionFactories = options.builtinExtensionFactories ?? [];
 		this.extensionFactories = options.extensionFactories ?? [];
 		this.noExtensions = options.noExtensions ?? false;
 		this.noSkills = options.noSkills ?? false;
@@ -508,8 +517,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 
 		const inlineExtensions = await this.loadExtensionFactories(extensionsResult.runtime);
+		const builtinExtensions = await this.loadBuiltinExtensionFactories(extensionsResult.runtime);
 		extensionsResult.extensions.push(...inlineExtensions.extensions);
 		extensionsResult.errors.push(...inlineExtensions.errors);
+		extensionsResult.extensions.push(...builtinExtensions.extensions);
+		extensionsResult.errors.push(...builtinExtensions.errors);
 		return extensionsResult;
 	}
 
@@ -524,15 +536,18 @@ export class DefaultResourceLoader implements ResourceLoader {
 		if (!preTrustExtensions) {
 			const extensionsResult = await loadExtensionsCached(extensionPaths, this.cwd, this.eventBus);
 			const inlineExtensions = await this.loadExtensionFactories(extensionsResult.runtime);
+			const builtinExtensions = await this.loadBuiltinExtensionFactories(extensionsResult.runtime);
 			extensionsResult.extensions.push(...inlineExtensions.extensions);
 			extensionsResult.errors.push(...inlineExtensions.errors);
+			extensionsResult.extensions.push(...builtinExtensions.extensions);
+			extensionsResult.errors.push(...builtinExtensions.errors);
 			this.addExtensionConflictDiagnostics(extensionsResult);
 			return extensionsResult;
 		}
 
 		const preloadedByPath = new Map(
 			preTrustExtensions.extensions
-				.filter((extension) => !extension.path.startsWith("<inline:"))
+				.filter((extension) => !this.isSyntheticExtensionPath(extension.path))
 				.map((extension) => [extension.resolvedPath, extension]),
 		);
 		const failedPreloadPaths = new Set(
@@ -556,10 +571,14 @@ export class DefaultResourceLoader implements ResourceLoader {
 		const inlineExtensions = preTrustExtensions.extensions.filter((extension) =>
 			extension.path.startsWith("<inline:"),
 		);
+		const builtinExtensions = preTrustExtensions.extensions.filter((extension) =>
+			extension.path.startsWith("<builtin:"),
+		);
 		const orderedExtensions = extensionPaths
 			.map((path) => loadedByPath.get(this.resolveExtensionLoadPath(path)))
 			.filter((extension): extension is Extension => extension !== undefined);
 		orderedExtensions.push(...inlineExtensions);
+		orderedExtensions.push(...builtinExtensions);
 
 		const extensionsResult: LoadExtensionsResult = {
 			extensions: orderedExtensions,
@@ -643,12 +662,15 @@ export class DefaultResourceLoader implements ResourceLoader {
 		if (this.noPromptTemplates && promptPaths.length === 0) {
 			promptsResult = { prompts: [], diagnostics: [] };
 		} else {
-			const allPrompts = loadPromptTemplates({
+			const discoveredPrompts = loadPromptTemplates({
 				cwd: this.cwd,
 				agentDir: this.agentDir,
 				promptPaths,
 				includeDefaults: false,
 			});
+			const allPrompts = this.noExtensions
+				? discoveredPrompts
+				: [...discoveredPrompts, ...getBuiltinPromptTemplates()];
 			promptsResult = this.dedupePrompts(allPrompts);
 		}
 		const resolvedPrompts = this.promptsOverride ? this.promptsOverride(promptsResult) : promptsResult;
@@ -908,6 +930,35 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 
 		return { extensions, errors };
+	}
+
+	private async loadBuiltinExtensionFactories(runtime: ExtensionRuntime): Promise<{
+		extensions: Extension[];
+		errors: Array<{ path: string; error: string }>;
+	}> {
+		if (this.noExtensions) {
+			return { extensions: [], errors: [] };
+		}
+
+		const extensions: Extension[] = [];
+		const errors: Array<{ path: string; error: string }> = [];
+
+		for (const { name, factory } of this.builtinExtensionFactories) {
+			const extensionPath = `<builtin:${name}>`;
+			try {
+				const extension = await loadExtensionFromFactory(factory, this.cwd, this.eventBus, runtime, extensionPath);
+				extensions.push(extension);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : "failed to load extension";
+				errors.push({ path: extensionPath, error: message });
+			}
+		}
+
+		return { extensions, errors };
+	}
+
+	private isSyntheticExtensionPath(path: string): boolean {
+		return path.startsWith("<inline:") || path.startsWith("<builtin:");
 	}
 
 	private dedupePrompts(prompts: PromptTemplate[]): { prompts: PromptTemplate[]; diagnostics: ResourceDiagnostic[] } {
